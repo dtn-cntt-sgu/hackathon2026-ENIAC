@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.aistudio/
+.playwright-mcp/
+.vercel/
+
+# Cấu hình Firebase cũ có thể chứa thông tin cấu hình riêng của dự án
+firebase-applet-config.json

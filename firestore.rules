@@ -1,0 +1,261 @@
+rules_version = '2';
+
+// Firestore Security Rules — Smart Wardrobe (project smart-wardrobe-79480)
+// Phân quyền theo architecture/phan-quyen.md:
+//   user      : chỉ đọc/ghi dữ liệu của chính mình; đọc kho đồ chung đã đăng
+//   admin     : + đọc kho đồ chung ở mọi trạng thái, đọc cấu hình, đọc nhật ký quản trị của mình
+//   sysadmin  : + đọc toàn bộ nhật ký quản trị
+// Vai trò nằm trong Custom Claims của Firebase Auth (request.auth.token.role), chỉ đặt được bằng
+// Admin SDK (Cloud Functions / script nội bộ). Mọi thao tác ghi của quản trị đi qua Cloud Functions,
+// nên client không ghi được catalog / config / auditLogs.
+//
+// Không vai trò nào đọc được hồ sơ, tủ đồ hay lịch sử phối đồ của người khác.
+// Mọi quyền đều yêu cầu đăng nhập Firebase Auth VÀ email đã xác thực. Tài khoản khách (Anonymous)
+// không có email nên không đọc/ghi được gì: dữ liệu khách chỉ nằm trên máy của họ.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function uid() {
+      return request.auth.uid;
+    }
+    // Tài khoản chưa được cấp vai trò (không có claim) là 'user'
+    function role() {
+      return signedIn() ? request.auth.token.get('role', 'user') : 'anonymous';
+    }
+    function isAdmin() {
+      return verified() && role() in ['admin', 'sysadmin'];
+    }
+    function isSysadmin() {
+      return verified() && role() == 'sysadmin';
+    }
+    // Email đã xác thực: Google tự xác thực; tài khoản email + mật khẩu phải bấm link
+    // trong thư xác thực của Firebase. Chặn tài khoản ảo dùng email của người khác.
+    function verified() {
+      return signedIn() && request.auth.token.get('email_verified', false) == true;
+    }
+    function isOwner(userId) {
+      return verified() && uid() == userId;
+    }
+
+    // Ảnh: đường dẫn https, ảnh mẫu trong /assets/, hoặc data URL jpeg/png/webp; tối đa ~350 KB.
+    // Không nhận javascript:, http:, hay nội dung không phải ảnh.
+    function isValidImageRef(value) {
+      return value is string && value.size() >= 1 && value.size() <= 350000 &&
+        value.matches('^(https://|/assets/|data:image/(jpeg|png|webp);base64,).*');
+    }
+    // Ảnh đại diện mặc định của app là SVG nội tuyến; chỉ hiện với chính chủ tài khoản.
+    function isValidAvatarRef(value) {
+      return isValidImageRef(value) ||
+        (value is string && value.size() <= 20000 && value.matches('^data:image/svg\\+xml;utf8,.*'));
+    }
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    function incoming() {
+      return request.resource.data;
+    }
+    function existing() {
+      return resource.data;
+    }
+    function optionalNumberIn(data, key, min, max) {
+      return !(key in data) || (data[key] is number && data[key] >= min && data[key] <= max);
+    }
+    function optionalStringMax(data, key, max) {
+      return !(key in data) || (data[key] is string && data[key].size() <= max);
+    }
+
+    // ---------- Validation: hồ sơ người dùng ----------
+    // Không có passwordHash (mật khẩu do Firebase Auth quản lý) và không có role/status
+    // (vai trò chỉ nằm trong Custom Claims) => client không thể tự nâng quyền.
+
+    function profileFields() {
+      return [
+        'uid', 'displayName', 'email', 'gender', 'favoriteStyles',
+        'accentColor', 'customAccentHex', 'themeMode', 'avatarUrl',
+        'heightCm', 'weightKg', 'bustCm', 'waistCm', 'hipCm',
+        'onboardingCompleted',
+        'cloudinaryCloudName', 'cloudinaryUploadPreset',
+        'emailjsServiceId', 'emailjsTemplateId', 'emailjsPublicKey',
+        'createdAt', 'updatedAt'
+      ];
+    }
+
+    // Phong cách yêu thích: 1–8 id ("minimalist") hoặc "custom:<chữ>", mỗi phần tử 1–60 ký tự.
+    // Rules không có vòng lặp nên kiểm tra từng vị trí 0..7.
+    function styleOk(styles, i) {
+      return styles.size() <= i ||
+        (styles[i] is string && styles[i].size() >= 1 && styles[i].size() <= 60);
+    }
+    function isValidStyleList(styles) {
+      return styles is list && styles.size() >= 1 && styles.size() <= 8 &&
+        styleOk(styles, 0) && styleOk(styles, 1) && styleOk(styles, 2) && styleOk(styles, 3) &&
+        styleOk(styles, 4) && styleOk(styles, 5) && styleOk(styles, 6) && styleOk(styles, 7);
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'uid', 'displayName', 'email', 'gender', 'favoriteStyles',
+          'accentColor', 'themeMode', 'onboardingCompleted', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly(profileFields()) &&
+        data.uid is string &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 150 &&
+        data.gender in ['Nữ', 'Nam'] &&
+        isValidStyleList(data.favoriteStyles) &&
+        data.accentColor in ['amber', 'rose', 'emerald', 'indigo', 'violet', 'slate', 'custom'] &&
+        (!('customAccentHex' in data) ||
+          (data.customAccentHex is string && data.customAccentHex.matches('^#[0-9a-f]{6}$'))) &&
+        data.themeMode in ['light', 'dark'] &&
+        data.onboardingCompleted is bool &&
+        (!('avatarUrl' in data) || isValidAvatarRef(data.avatarUrl)) &&
+        optionalNumberIn(data, 'heightCm', 100, 250) &&
+        optionalNumberIn(data, 'weightKg', 25, 250) &&
+        optionalNumberIn(data, 'bustCm', 40, 200) &&
+        optionalNumberIn(data, 'waistCm', 35, 200) &&
+        optionalNumberIn(data, 'hipCm', 40, 200) &&
+        optionalStringMax(data, 'cloudinaryCloudName', 100) &&
+        optionalStringMax(data, 'cloudinaryUploadPreset', 100) &&
+        optionalStringMax(data, 'emailjsServiceId', 100) &&
+        optionalStringMax(data, 'emailjsTemplateId', 100) &&
+        optionalStringMax(data, 'emailjsPublicKey', 100) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // ---------- Validation: món đồ trong tủ ----------
+
+    function isValidWardrobeItem(data) {
+      return data.keys().hasAll([
+          'userId', 'name', 'category', 'styleTag', 'color',
+          'season', 'occasion', 'imageUrl', 'favorite', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userId', 'name', 'category', 'styleTag', 'color',
+          'season', 'occasion', 'imageUrl', 'favorite', 'createdAt', 'updatedAt'
+        ]) &&
+        data.userId is string &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+        data.category in ['Áo', 'Quần', 'Chân váy', 'Đầm & Váy liền', 'Áo khoác', 'Giày dép', 'Phụ kiện', 'Quần & Chân váy'] &&
+        data.styleTag is string && data.styleTag.size() >= 1 && data.styleTag.size() <= 60 &&
+        data.color is string && data.color.size() >= 1 && data.color.size() <= 50 &&
+        data.season in ['Mọi thời tiết', 'Nắng ấm', 'Mát mẻ', 'Se lạnh', 'Mưa'] &&
+        data.occasion in ['Đi làm / Đi học', 'Dạo phố / Cafe', 'Tiệc tối / Hẹn hò', 'Thể thao / Vận động', 'Du lịch'] &&
+        isValidImageRef(data.imageUrl) &&
+        data.favorite is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // ---------- Validation: bộ đồ đã lưu (Lịch sử phối đồ) ----------
+
+    function isValidSavedOutfit(data) {
+      return data.keys().hasAll([
+          'userId', 'title', 'occasion', 'weatherNote', 'items', 'auraAdvice', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userId', 'title', 'occasion', 'weatherNote', 'items', 'auraAdvice', 'createdAt'
+        ]) &&
+        data.userId is string &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.occasion is string && data.occasion.size() >= 1 && data.occasion.size() <= 60 &&
+        data.weatherNote is string && data.weatherNote.size() >= 1 && data.weatherNote.size() <= 120 &&
+        data.items is list && data.items.size() >= 1 && data.items.size() <= 8 &&
+        data.auraAdvice is string && data.auraAdvice.size() >= 1 && data.auraAdvice.size() <= 800 &&
+        data.createdAt is timestamp;
+    }
+
+    // ---------- Mặc định: cấm hết ----------
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ---------- users/{userId}: chỉ chủ tài khoản ----------
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+
+      allow create: if isValidId(userId) && isOwner(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(userId) && isOwner(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(userId) && isOwner(userId);
+    }
+
+    // ---------- wardrobeItems/{itemId}: chỉ chủ món đồ ----------
+    // Truy vấn danh sách phải lọc where('userId', '==', uid) thì mới được phép.
+
+    match /wardrobeItems/{itemId} {
+      allow read: if verified() && existing().userId == uid();
+
+      allow create: if isValidId(itemId) &&
+        verified() && incoming().userId == uid() &&
+        isValidWardrobeItem(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(itemId) &&
+        verified() && existing().userId == uid() &&
+        incoming().userId == existing().userId &&
+        isValidWardrobeItem(incoming()) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if verified() && existing().userId == uid();
+    }
+
+    // ---------- savedOutfits/{outfitId}: chỉ chủ bộ đồ, không sửa sau khi lưu ----------
+
+    match /savedOutfits/{outfitId} {
+      allow read: if verified() && existing().userId == uid();
+
+      allow create: if isValidId(outfitId) &&
+        verified() && incoming().userId == uid() &&
+        isValidSavedOutfit(incoming()) &&
+        incoming().createdAt == request.time;
+
+      allow update: if false;
+      allow delete: if verified() && existing().userId == uid();
+    }
+
+    // ---------- catalog/{catalogItemId}: kho đồ chung (phan-quyen.md mục 2) ----------
+    // Người dùng đăng nhập thấy món đã đăng; admin/sysadmin thấy cả nháp và đã ẩn.
+    // Tạo / sửa / ẩn / xoá chỉ qua Cloud Functions (Admin SDK bỏ qua Rules).
+
+    match /catalog/{catalogItemId} {
+      allow read: if verified() && (existing().status == 'published' || isAdmin());
+      allow write: if false;
+    }
+
+    // ---------- config/{doc}: hạn mức, model AI ----------
+
+    match /config/{docId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ---------- auditLogs/{logId}: nhật ký quản trị, không ai sửa/xoá ----------
+
+    match /auditLogs/{logId} {
+      allow read: if isSysadmin() || (isAdmin() && role() == 'admin' && existing().actorUid == uid());
+      allow write: if false;
+    }
+  }
+}
